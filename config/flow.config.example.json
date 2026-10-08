@@ -1,9 +1,10 @@
 {
   "flowHome": ".",
-  "flowUrl": "https://labs.google/fx/fr/tools/flow",
+  "flowUrl": "https://labs.google/fx/tools/flow",
   "expectedAccount": "your-email@gmail.com",
-  "chromeProfile": "Profile 3",
-  "chromeUserDataDir": "/path/to/chrome/user-data",
+  "chromePath": "",
+  "chromeProfile": "Default",
+  "chromeUserDataDir": "",
   "cdpPort": 9222,
   "jobTimeoutMs": 300000,
   "actionDelayMs": 800,
@@ -11,7 +12,7 @@
   "maxPollAttempts": 120,
   "downloadWaitMs": 30000,
   "browserMode": "direct-cdp",
-  "headless": true,
+  "headless": false,
   "imageModels": {
     "Nano Banana Pro": "nano-banana-pro",
     "Nano Banana 2": "nano-banana-2",
@@ -28,5 +29,5 @@
   "durations": ["4s", "6s", "8s", "10s"],
   "quantities": [1, 2, 3, 4],
   "discoveredPages": ["main", "project", "characters", "scenes", "tools", "trash"],
-  "locale": "fr"
+  "locale": "en"
 }
