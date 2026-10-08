@@ -19,7 +19,7 @@ function expandPath(value) {
 }
 
 function firstExisting(candidates) {
-  return candidates.map(expandPath).find(Boolean)?.split('\0')[0] && candidates
+  return candidates
     .map(expandPath)
     .find(candidate => candidate && fs.existsSync(candidate));
 }
