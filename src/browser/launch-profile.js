@@ -1,14 +1,58 @@
 import { chromium } from 'playwright';
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
 import { logger } from '../utils/logger.js';
 import { get } from '../utils/config.js';
 import { FlowError, ErrorCodes } from '../utils/errors.js';
 import { launchChromeDirect, setPage, setContext, setConnected, setBrowser, isBrowserConnected } from './connect.js';
 
-const CHROME_PATH = '/opt/google/chrome/chrome';
 const CDP_PORT = get('cdpPort', 9222);
-const FLOW_URL = get('flowUrl', 'https://labs.google/fx/fr/tools/flow');
+const FLOW_URL = get('flowUrl', 'https://labs.google/fx/tools/flow');
+
+function expandPath(value) {
+  if (!value) return value;
+  let out = value.replace(/^~(?=$|[\\/])/, os.homedir());
+  out = out.replace(/%([^%]+)%/g, (m, name) => process.env[name] ?? m);
+  out = out.replace(/\$([A-Z_][A-Z0-9_]*)/gi, (m, name) => process.env[name] ?? m);
+  return path.resolve(out);
+}
+
+function firstExisting(candidates) {
+  return candidates.map(expandPath).find(Boolean)?.split('\0')[0] && candidates
+    .map(expandPath)
+    .find(candidate => candidate && fs.existsSync(candidate));
+}
+
+function defaultChromePath() {
+  if (process.platform === 'win32') {
+    return firstExisting([
+      '%PROGRAMFILES%\\Google\\Chrome\\Application\\chrome.exe',
+      '%PROGRAMFILES(X86)%\\Google\\Chrome\\Application\\chrome.exe',
+      '%LOCALAPPDATA%\\Google\\Chrome\\Application\\chrome.exe',
+    ]);
+  }
+  if (process.platform === 'darwin') {
+    return '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+  }
+  return firstExisting([
+    '/opt/google/chrome/chrome',
+    '/usr/bin/google-chrome',
+    '/usr/bin/google-chrome-stable',
+    '/usr/bin/chromium',
+    '/usr/bin/chromium-browser',
+  ]);
+}
+
+function defaultUserDataDir() {
+  if (process.platform === 'win32') {
+    return expandPath('%LOCALAPPDATA%\\GoogleFlowMCP\\ChromeUserData');
+  }
+  if (process.platform === 'darwin') {
+    return path.join(os.homedir(), 'Library', 'Application Support', 'GoogleFlowMCP', 'ChromeUserData');
+  }
+  return path.join(os.homedir(), '.config', 'google-flow-mcp', 'chrome-user-data');
+}
 
 export async function launchKiaraProfile(headless = false) {
   if (isBrowserConnected()) {
@@ -16,17 +60,27 @@ export async function launchKiaraProfile(headless = false) {
     return { success: true, message: 'Already connected' };
   }
 
-  const profileSource = path.resolve(process.env.HOME, '.config/google-chrome/Profile 3');
+  const chromePath = expandPath(process.env.FLOW_CHROME_PATH || get('chromePath')) || defaultChromePath();
+  const userDataDir = expandPath(process.env.FLOW_CHROME_USER_DATA_DIR || get('chromeUserDataDir')) || defaultUserDataDir();
+  const profileName = process.env.FLOW_CHROME_PROFILE || get('chromeProfile', 'Default');
 
-  if (!fs.existsSync(profileSource)) {
-    throw new FlowError(ErrorCodes.CONFIG_ERROR,
-      `Profile 3 not found at ${profileSource}. Make sure Chrome Profile 3 exists and is configured with your Google account.`);
+  if (!chromePath || !fs.existsSync(chromePath)) {
+    throw new FlowError(
+      ErrorCodes.CONFIG_ERROR,
+      'Google Chrome was not found. Set chromePath in config/flow.config.json or FLOW_CHROME_PATH.'
+    );
   }
 
-  logger.info('Launching Chrome via direct+CDP method (anti-detection)', { profileSource });
+  fs.mkdirSync(userDataDir, { recursive: true });
+
+  logger.info('Preparing persistent Chrome + CDP session', {
+    chromePath,
+    userDataDir,
+    profileName,
+    cdpPort: CDP_PORT,
+  });
 
   try {
-    // Try connecting to existing Chrome instance first
     const existing = await chromium.connectOverCDP(`http://127.0.0.1:${CDP_PORT}`);
     logger.info('Found existing Chrome instance, reusing');
     const ctx = existing.contexts()[0];
@@ -34,24 +88,27 @@ export async function launchKiaraProfile(headless = false) {
     setBrowser(existing);
     setContext(ctx);
     setConnected(true);
-    if (pg) { setPage(pg); return { browser: existing, context: ctx, page: pg }; }
+    if (pg) {
+      setPage(pg);
+      return { browser: existing, context: ctx, page: pg };
+    }
     const newPage = await ctx.newPage();
     setPage(newPage);
     return { browser: existing, context: ctx, page: newPage };
   } catch {
-    // Launch Chrome directly (not via Playwright) for anti-detection
     return await launchChromeDirect({
-      chromePath: CHROME_PATH,
+      chromePath,
       cdpPort: CDP_PORT,
       headless,
-      profileSource,
+      userDataDir,
+      profileName,
     });
   }
 }
 
 export async function navigateToFlow(page, toolPage) {
   const targetUrl = toolPage === true
-    ? 'https://labs.google/fx/fr/tools/flow'
+    ? 'https://labs.google/fx/tools/flow'
     : FLOW_URL;
 
   logger.info('Navigating to Google Flow', { url: targetUrl });
@@ -62,8 +119,11 @@ export async function navigateToFlow(page, toolPage) {
   logger.info('Flow page loaded', { url: currentUrl.substring(0, 100) });
 
   if (currentUrl.includes('accounts.google.com')) {
-    return { authenticated: false, url: currentUrl,
-      message: 'OAuth blocked — Google detects automation. Use Chrome direct+CDP launch method.' };
+    return {
+      authenticated: false,
+      url: currentUrl,
+      message: 'Google sign-in is required in the persistent MCP Chrome profile. Complete it once, then retry.',
+    };
   }
 
   return { authenticated: true, url: currentUrl };
