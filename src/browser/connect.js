@@ -1,16 +1,24 @@
 import { chromium } from 'playwright';
 import path from 'path';
 import fs from 'fs';
+import os from 'os';
 import { spawn } from 'child_process';
 import { logger } from '../utils/logger.js';
 import { get } from '../utils/config.js';
 import { FlowError, ErrorCodes } from '../utils/errors.js';
-import { takeScreenshot } from '../utils/screenshots.js';
 
 let browser = null;
 let context = null;
 let page = null;
 let isConnected = false;
+
+function expandPath(value) {
+  if (!value) return value;
+  let out = value.replace(/^~(?=$|[\\/])/, os.homedir());
+  out = out.replace(/%([^%]+)%/g, (m, name) => process.env[name] ?? m);
+  out = out.replace(/\$([A-Z_][A-Z0-9_]*)/gi, (m, name) => process.env[name] ?? m);
+  return path.resolve(out);
+}
 
 export async function connectToBrowser(options = {}) {
   if (isConnected && page) {
@@ -22,18 +30,12 @@ export async function connectToBrowser(options = {}) {
   const cdpUrl = `http://127.0.0.1:${cdpPort}`;
 
   try {
-    // Try connecting to existing Chrome instance via CDP
     logger.info('Attempting CDP connection', { url: cdpUrl });
     browser = await chromium.connectOverCDP(cdpUrl);
     logger.info('Connected via CDP');
 
     const contexts = browser.contexts();
-    if (contexts.length > 0) {
-      context = contexts[0];
-    } else {
-      context = await browser.newContext();
-    }
-
+    context = contexts.length > 0 ? contexts[0] : await browser.newContext();
     const pages = context.pages();
     page = pages.length > 0 ? pages[0] : await context.newPage();
     isConnected = true;
@@ -46,139 +48,151 @@ export async function connectToBrowser(options = {}) {
 }
 
 async function launchNewBrowser(cdpPort, options = {}) {
-  const chromePath = options.chromePath || '/opt/google/chrome/chrome';
-  const profileDir = options.profileDir || path.resolve(import.meta.dirname, '../../chrome-profile-kiara');
+  const chromePath = expandPath(options.chromePath || process.env.FLOW_CHROME_PATH || get('chromePath'));
+  const userDataDir = expandPath(
+    options.userDataDir ||
+    process.env.FLOW_CHROME_USER_DATA_DIR ||
+    get('chromeUserDataDir') ||
+    path.join(os.homedir(), '.google-flow-mcp', 'chrome-user-data')
+  );
+  const profileName = options.profileName || process.env.FLOW_CHROME_PROFILE || get('chromeProfile', 'Default');
 
-  if (!fs.existsSync(chromePath)) {
-    throw new FlowError(ErrorCodes.PLAYWRIGHT_ERROR, `Chrome not found at ${chromePath}`);
+  if (!chromePath || !fs.existsSync(chromePath)) {
+    throw new FlowError(ErrorCodes.PLAYWRIGHT_ERROR, `Chrome not found at ${chromePath || '(not configured)'}`);
   }
+
+  fs.mkdirSync(userDataDir, { recursive: true });
 
   const args = [
     `--remote-debugging-port=${cdpPort}`,
-    `--user-data-dir=${profileDir}`,
+    `--user-data-dir=${userDataDir}`,
+    `--profile-directory=${profileName}`,
     '--no-first-run',
     '--no-default-browser-check',
     '--disable-blink-features=AutomationControlled',
-    `--window-size=1920,1080`,
+    '--window-size=1920,1080',
   ];
 
-  if (get('headless', false)) {
-    args.push('--headless=new');
-  }
+  if (get('headless', false)) args.push('--headless=new');
 
-  // Kill any existing Chrome on this debugging port
-  try {
-    const existing = await chromium.connectOverCDP(`http://127.0.0.1:${cdpPort}`);
-    await existing.close();
-  } catch (e) {
-    // No existing instance, that's fine
-  }
-
-  logger.info('Launching Chrome with Kiara profile', {
+  logger.info('Launching Chrome with persistent MCP profile', {
     chromePath,
-    profileDir,
+    userDataDir,
+    profileName,
     cdpPort,
   });
 
-  browser = await chromium.launch({
-    executablePath: chromePath,
-    args,
-    headless: false,
+  return await launchChromeDirect({
+    chromePath,
+    cdpPort,
+    headless: get('headless', false),
+    userDataDir,
+    profileName,
   });
-
-  context = browser.contexts()[0] || await browser.newContext();
-  page = context.pages()[0] || await context.newPage();
-  isConnected = true;
-
-  logger.info('New browser launched successfully');
-  return { browser, context, page };
 }
 
 /**
- * Launch Chrome DIRECTLY (not via Playwright) to avoid automation detection
- * (navigator.webdriver=false). Creates temp user-data-dir with Profile 3 cookies,
- * launches Chrome via shell, then connects Playwright via CDP.
+ * Launch Chrome directly and connect through CDP.
+ *
+ * The MCP profile is persistent: cookies and Google login remain in userDataDir
+ * across runs. Use a dedicated MCP user-data directory rather than your normal
+ * day-to-day Chrome profile to avoid profile locks and Chrome remote-debugging
+ * restrictions.
  */
 export async function launchChromeDirect(options = {}) {
-  const chromePath = options.chromePath || '/opt/google/chrome/chrome';
+  const chromePath = expandPath(options.chromePath || process.env.FLOW_CHROME_PATH || get('chromePath'));
   const cdpPort = options.cdpPort || get('cdpPort', 9222);
   const headless = options.headless ?? get('headless', false);
-  const profileSource = options.profileSource || path.resolve(process.env.HOME, '.config/google-chrome/Profile 3');
+  const userDataDir = expandPath(
+    options.userDataDir ||
+    process.env.FLOW_CHROME_USER_DATA_DIR ||
+    get('chromeUserDataDir') ||
+    path.join(os.homedir(), '.google-flow-mcp', 'chrome-user-data')
+  );
+  const profileName = options.profileName || process.env.FLOW_CHROME_PROFILE || get('chromeProfile', 'Default');
 
   if (isConnected && page) {
     logger.info('Already connected, reusing browser');
     return { browser, context, page };
   }
 
-  if (!fs.existsSync(chromePath)) {
-    throw new FlowError(ErrorCodes.PLAYWRIGHT_ERROR, `Chrome not found at ${chromePath}`);
+  if (!chromePath || !fs.existsSync(chromePath)) {
+    throw new FlowError(ErrorCodes.PLAYWRIGHT_ERROR, `Chrome not found at ${chromePath || '(not configured)'}`);
   }
 
-  const tempDir = `/tmp/chrome-kiara-cdp-${Date.now()}`;
-  fs.mkdirSync(tempDir, { recursive: true });
-
-  const localStateSrc = path.resolve(path.dirname(profileSource), '../Local State');
-  if (fs.existsSync(profileSource)) {
-    fs.cpSync(profileSource, path.join(tempDir, 'Profile 3'), { recursive: true });
-  }
-  if (fs.existsSync(localStateSrc)) {
-    fs.cpSync(localStateSrc, path.join(tempDir, 'Local State'));
-  } else {
-    fs.writeFileSync(path.join(tempDir, 'Local State'), JSON.stringify({ profile: { info_cache: {} } }));
-  }
-
-  logger.info('Temp profile created with cookies', { tempDir });
+  fs.mkdirSync(userDataDir, { recursive: true });
 
   try {
     const existing = await chromium.connectOverCDP(`http://127.0.0.1:${cdpPort}`);
-    await existing.close();
-    await new Promise(r => setTimeout(r, 1000));
-  } catch { }
+    logger.info('Existing CDP Chrome found, reusing');
+    browser = existing;
+    context = browser.contexts()[0];
+    page = context?.pages()[0] || await context.newPage();
+    isConnected = true;
+    return { browser, context, page };
+  } catch {
+    // No CDP browser is running yet.
+  }
 
   const args = [
     `--remote-debugging-port=${cdpPort}`,
-    `--user-data-dir=${tempDir}`,
-    '--profile-directory=Profile 3',
-    '--no-first-run', '--no-default-browser-check',
+    `--user-data-dir=${userDataDir}`,
+    `--profile-directory=${profileName}`,
+    '--no-first-run',
+    '--no-default-browser-check',
     '--disable-blink-features=AutomationControlled',
     '--window-size=1920,1080',
   ];
   if (headless) args.push('--headless=new');
 
-  logger.info('Launching Chrome directly', { chromePath, cdpPort, headless });
+  logger.info('Launching Chrome directly', {
+    chromePath,
+    cdpPort,
+    headless,
+    userDataDir,
+    profileName,
+  });
 
-  const chromeProcess = spawn(chromePath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
+  const chromeProcess = spawn(chromePath, args, {
+    stdio: ['ignore', 'pipe', 'pipe'],
+    detached: false,
+  });
+
+  chromeProcess.on('error', (err) => {
+    logger.error('Chrome process failed', { error: err.message });
+  });
 
   const cdpUrl = `http://127.0.0.1:${cdpPort}`;
   let attempts = 0;
-  while (attempts < 20) {
+  while (attempts < 25) {
     try {
       const resp = await fetch(`${cdpUrl}/json/version`);
       if (resp.ok) break;
-    } catch { }
+    } catch {
+      // Wait for Chrome to expose CDP.
+    }
     await new Promise(r => setTimeout(r, 1000));
     attempts++;
   }
-  if (attempts >= 20) {
+
+  if (attempts >= 25) {
     throw new FlowError(ErrorCodes.PLAYWRIGHT_ERROR, 'Chrome CDP failed to start in time');
   }
 
   browser = await chromium.connectOverCDP(cdpUrl);
   context = browser.contexts()[0];
-  page = context.pages()[0] || await context.newPage();
+  page = context?.pages()[0] || await context.newPage();
   isConnected = true;
-  global.__chromeTempDir = tempDir;
 
-  logger.info('Chrome direct + CDP connected', { webdriver: await page.evaluate(() => navigator.webdriver) });
+  logger.info('Chrome direct + CDP connected', {
+    webdriver: await page.evaluate(() => navigator.webdriver),
+    persistentProfile: userDataDir,
+  });
+
   return { browser, context, page };
 }
 
 export async function closeBrowser() {
-  if (global.__chromeTempDir) {
-    try { fs.rmSync(global.__chromeTempDir, { recursive: true, force: true }); }
-    catch (e) { logger.warn('Temp cleanup failed', { error: e.message }); }
-    global.__chromeTempDir = null;
-  }
   if (browser) {
     try {
       await browser.close();
@@ -190,7 +204,7 @@ export async function closeBrowser() {
   context = null;
   page = null;
   isConnected = false;
-  logger.info('Browser disconnected');
+  logger.info('Browser disconnected; persistent profile data kept on disk');
 }
 
 export function getPage() {
