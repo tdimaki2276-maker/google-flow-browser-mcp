@@ -5,17 +5,31 @@ $ProjectDir = Split-Path -Parent (Split-Path -Parent $MyInvocation.MyCommand.Pat
 $ProgramFilesX86 = [Environment]::GetEnvironmentVariable("ProgramFiles(x86)")
 
 function Find-NodeExe {
-  $candidates = @(
-    (Join-Path $env:ProgramFiles "nodejs\node.exe"),
-    $(if ($ProgramFilesX86) { Join-Path $ProgramFilesX86 "nodejs\node.exe" }),
-    (Join-Path $env:LOCALAPPDATA "Programs\nodejs\node.exe"),
-    (Join-Path $env:LOCALAPPDATA "nodejs\node.exe")
-  ) | Where-Object { $_ -and (Test-Path $_) }
+  $candidateList = New-Object System.Collections.Generic.List[string]
 
-  if ($candidates.Count -gt 0) { return $candidates[0] }
+  if ($env:ProgramFiles) { $candidateList.Add((Join-Path $env:ProgramFiles "nodejs\node.exe")) }
+  if ($ProgramFilesX86) { $candidateList.Add((Join-Path $ProgramFilesX86 "nodejs\node.exe")) }
+  if ($env:LOCALAPPDATA) {
+    $candidateList.Add((Join-Path $env:LOCALAPPDATA "Programs\nodejs\node.exe"))
+    $candidateList.Add((Join-Path $env:LOCALAPPDATA "nodejs\node.exe"))
+  }
+
+  if ($env:USERPROFILE) {
+    $candidateList.Add((Join-Path $env:USERPROFILE "Documents\Video Editor\remotion-editor\.tools\node\node.exe"))
+    $candidateList.Add((Join-Path $env:USERPROFILE "Desktop\remotion-editor\.tools\node\node.exe"))
+
+    Get-ChildItem -Path $env:USERPROFILE -Directory -Filter "OneDrive*" -ErrorAction SilentlyContinue | ForEach-Object {
+      $candidateList.Add((Join-Path $_.FullName "Documents\Video Editor\remotion-editor\.tools\node\node.exe"))
+    }
+  }
+
+  foreach ($candidate in $candidateList) {
+    if ($candidate -and (Test-Path -LiteralPath $candidate)) { return $candidate }
+  }
 
   $cmd = Get-Command node.exe -ErrorAction SilentlyContinue
   if ($cmd) { return $cmd.Source }
+
   return $null
 }
 
